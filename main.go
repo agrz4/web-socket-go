@@ -1,99 +1,94 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"text/template"
 
 	"github.com/gorilla/websocket"
 )
 
-// upgrader akan meng-upgrade HTTP request menjadi koneksi WebSocket.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return r.Header.Get("Origin") == "yourdomain.com"
-	},
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-var (
-	// clients menyimpan semua koneksi WebSocket yang aktif.
-	clients = make(map[*websocket.Conn]bool)
+var clients = make(map[*websocket.Conn]bool)
+var broadcast = make(chan Message)
 
-	// broadcast adalah channel untuk mengirim pesan ke semua klien.
-	broadcast = make(chan []byte)
+type Message struct {
+	Username string `json:"username"`
+	Message  string `json:"message"`
+}
 
-	// mutex digunakan untuk mengamankan akses ke map `clients`
-	// dari race condition.
-	mutex = &sync.Mutex{}
-)
-
-// wsHandler menangani permintaan WebSocket dari klien.
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Error upgrading to WebSocket: %v", err)
+		log.Printf("error: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer ws.Close()
 
-	// Menambahkan klien baru ke map.
-	mutex.Lock()
-	clients[conn] = true
-	mutex.Unlock()
-	log.Printf("New client connected: %v", conn.RemoteAddr())
+	clients[ws] = true
+	log.Printf("New client connected. Current number of clients: %d", len(clients))
 
-	// Membaca pesan dari klien secara terus-menerus.
 	for {
-		_, message, err := conn.ReadMessage()
+		var msg Message
+		err := ws.ReadJSON(&msg)
 		if err != nil {
-			log.Printf("Client disconnected or error reading message: %v", err)
-
-			// Menghapus klien yang terputus dari map.
-			mutex.Lock()
-			delete(clients, conn)
-			mutex.Unlock()
+			log.Printf("error: %v", err)
+			delete(clients, ws)
+			log.Printf("Client disconnected. Current number of clients: %d", len(clients))
 			break
 		}
-		// Mengirim pesan ke channel broadcast untuk didistribusikan.
-		broadcast <- message
+		log.Printf("Get Message from '%s': %s", msg.Username, msg.Message)
+		broadcast <- msg
 	}
 }
 
-// handleMessages mendengarkan pesan dari channel `broadcast`
-// dan mengirimkannya ke semua klien yang terhubung.
 func handleMessages() {
 	for {
-		message := <-broadcast
-
-		mutex.Lock()
+		msg := <-broadcast
+		log.Printf("Broadcast the message '%s' to all clients", msg.Message)
 		for client := range clients {
-			err := client.WriteMessage(websocket.TextMessage, message)
+			err := client.WriteJSON(msg)
 			if err != nil {
-				log.Printf("Error writing message to client: %v", err)
+				log.Printf("error: %v", err)
 				client.Close()
 				delete(clients, client)
+				log.Printf("Client disconnected. Current number of clients: %d", len(clients))
 			}
 		}
-		mutex.Unlock()
 	}
+}
+
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+	tmpl, err := template.ParseFiles("index.html")
+	if err != nil {
+		http.Error(w, "File not found", http.StatusInternalServerError)
+		return
+	}
+	tmpl.Execute(w, nil)
 }
 
 func main() {
-	// Menangani endpoint WebSocket
-	http.HandleFunc("/ws", wsHandler)
+	// Mengatur rute untuk server
+	http.HandleFunc("/", serveHome)
+	http.HandleFunc("/ws", handleConnections)
 
-	// Menjalankan goroutine untuk menangani pesan siaran
+	// Mulai goroutine untuk menangani pesan
 	go handleMessages()
 
-	log.Println("WebSocket server started on :8080")
-	fmt.Println("Access the WebSocket client at http://localhost:8080")
-
-	// Menjalankan server HTTP
+	log.Println("Server Golang sedang berjalan di http://localhost:8080")
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
-		log.Fatalf("Error starting server: %v", err)
+		log.Fatal("ListenAndServe: ", err)
 	}
 }
